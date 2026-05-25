@@ -37,23 +37,13 @@ struct GrabEntry {
     slice_mode: SliceMode,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct GlobalOptions {
-    format: Format,
+    format: Option<Format>,
     output: Option<PathBuf>,
     copy: bool,
+    tokens: bool,
     ignores: Vec<String>,
-}
-
-impl Default for GlobalOptions {
-    fn default() -> Self {
-        GlobalOptions {
-            format: Format::Markdown,
-            output: None,
-            copy: false,
-            ignores: Vec::new(),
-        }
-    }
 }
 
 impl GrabFile {
@@ -156,7 +146,12 @@ impl GrabFile {
         all_contents.sort_by(|a, b| a.path.cmp(&b.path));
 
         // Format output
-        let formatter = Formatter::new(self.global_options.format.clone());
+        let format = self
+            .global_options
+            .format
+            .clone()
+            .unwrap_or_else(|| config.defaults.format.clone().into());
+        let formatter = Formatter::new(format).with_tokens(self.global_options.tokens);
         let output = formatter.format(&all_contents)?;
 
         // Determine destination
@@ -182,12 +177,12 @@ fn parse_global_option(line: &str, options: &mut GlobalOptions) -> Result<()> {
             let format = parts
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("Invalid syntax: --format requires a value"))?;
-            options.format = match *format {
+            options.format = Some(match *format {
                 "md" | "markdown" => Format::Markdown,
                 "plain" | "text" => Format::Plain,
                 "json" => Format::Json,
                 _ => anyhow::bail!("Invalid syntax: unknown format '{}'", format),
-            };
+            });
         }
         Some("--output") => {
             let path = parts
@@ -197,6 +192,9 @@ fn parse_global_option(line: &str, options: &mut GlobalOptions) -> Result<()> {
         }
         Some("--copy") => {
             options.copy = true;
+        }
+        Some("--tokens") => {
+            options.tokens = true;
         }
         Some("--ignore") => {
             let pattern = parts
@@ -324,7 +322,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let grabfile = GrabFile::parse(&path).unwrap();
-        assert!(matches!(grabfile.global_options.format, Format::Json));
+        assert!(matches!(grabfile.global_options.format, Some(Format::Json)));
     }
 
     #[test]
@@ -348,6 +346,16 @@ mod tests {
 
         let grabfile = GrabFile::parse(&path).unwrap();
         assert!(grabfile.global_options.copy);
+    }
+
+    #[test]
+    fn test_parse_global_tokens_option() {
+        let content = "--tokens\nsrc/*.rs";
+        let file = create_temp_grabfile(content);
+        let path = file.path().to_path_buf();
+
+        let grabfile = GrabFile::parse(&path).unwrap();
+        assert!(grabfile.global_options.tokens);
     }
 
     #[test]
@@ -443,9 +451,10 @@ mod tests {
     #[test]
     fn test_default_global_options() {
         let options = GlobalOptions::default();
-        assert!(matches!(options.format, Format::Markdown));
+        assert!(options.format.is_none());
         assert!(options.output.is_none());
         assert!(!options.copy);
+        assert!(!options.tokens);
         assert!(options.ignores.is_empty());
     }
 }

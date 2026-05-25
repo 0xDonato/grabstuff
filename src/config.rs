@@ -19,9 +19,30 @@ pub struct Config {
     pub defaults: Defaults,
 }
 
+/// Default output format from configuration.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultFormat {
+    /// Markdown format.
+    #[serde(alias = "markdown")]
+    Md,
+    /// Plain text format.
+    #[serde(alias = "text")]
+    Plain,
+    /// JSON format.
+    Json,
+}
+
+fn default_format() -> DefaultFormat {
+    DefaultFormat::Md
+}
+
 /// Default settings for file matching and output.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Defaults {
+    /// Default output format.
+    #[serde(default = "default_format")]
+    pub format: DefaultFormat,
     /// Glob patterns for files and directories to ignore.
     /// Defaults to common directories like `.git/`, `node_modules/`, `target/`.
     #[serde(default = "default_ignores")]
@@ -40,6 +61,7 @@ fn default_ignores() -> Vec<String> {
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
+            format: default_format(),
             ignore: default_ignores(),
         }
     }
@@ -87,6 +109,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        assert_eq!(config.defaults.format, DefaultFormat::Md);
         assert!(!config.defaults.ignore.is_empty());
         assert!(config.defaults.ignore.contains(&".git/".to_string()));
         assert!(config
@@ -102,6 +125,19 @@ mod tests {
         assert_eq!(ignores.len(), 4);
         assert!(ignores.contains(&".git/".to_string()));
         assert!(ignores.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn test_parse_default_format_from_config() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+defaults:
+  format: json
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.defaults.format, DefaultFormat::Json);
     }
 
     #[test]

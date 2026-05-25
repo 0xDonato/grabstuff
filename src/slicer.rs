@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+const UTF8_MAX_BYTES_PER_CHAR: usize = 4;
+
 /// Specifies how to slice file content.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SliceMode {
@@ -110,7 +112,11 @@ impl Slicer {
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
         let reader = BufReader::with_capacity(64 * 1024, file); // 64KB buffer
 
-        let mut lines = Vec::with_capacity(n);
+        if n == 0 {
+            return Ok((String::new(), SliceInfo::Lines { start: 0, end: 0 }));
+        }
+
+        let mut lines = Vec::with_capacity(n.min(1024));
         for line in reader.lines().take(n) {
             lines.push(line.with_context(|| format!("Failed to read file: {}", path.display()))?);
         }
@@ -132,8 +138,15 @@ impl Slicer {
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
         let mut reader = BufReader::with_capacity(64 * 1024, file);
 
+        if n == 0 {
+            return Ok((String::new(), SliceInfo::Chars { start: 0, end: 0 }));
+        }
+
+        let file_size = reader.get_ref().metadata()?.len() as usize;
+
         // Read enough bytes to get n chars (UTF-8 can be up to 4 bytes per char)
-        let mut buffer = vec![0u8; n * 4];
+        let bytes_to_read = n.saturating_mul(UTF8_MAX_BYTES_PER_CHAR).min(file_size);
+        let mut buffer = vec![0u8; bytes_to_read];
         let bytes_read = reader.read(&mut buffer)?;
         buffer.truncate(bytes_read);
 
@@ -157,7 +170,7 @@ impl Slicer {
         let metadata = file.metadata()?;
         let file_size = metadata.len();
 
-        if file_size == 0 {
+        if file_size == 0 || n == 0 {
             return Ok((String::new(), SliceInfo::Lines { start: 0, end: 0 }));
         }
 
@@ -226,13 +239,18 @@ impl Slicer {
         lines_found.reverse();
         let count = lines_found.len();
         let content = lines_found.join("\n");
+        let total_lines = count_file_lines(path)?;
+        let start = if count == 0 {
+            0
+        } else {
+            total_lines.saturating_sub(count) + 1
+        };
 
-        // We don't know exact line numbers without counting, so estimate
         Ok((
             content,
             SliceInfo::Lines {
-                start: 1, // approximate
-                end: count,
+                start,
+                end: total_lines,
             },
         ))
     }
@@ -243,12 +261,12 @@ impl Slicer {
         let metadata = file.metadata()?;
         let file_size = metadata.len() as usize;
 
-        if file_size == 0 {
+        if file_size == 0 || n == 0 {
             return Ok((String::new(), SliceInfo::Chars { start: 0, end: 0 }));
         }
 
         // Read from end - estimate bytes needed (4 bytes per char max for UTF-8)
-        let bytes_to_read = (n * 4).min(file_size);
+        let bytes_to_read = n.saturating_mul(UTF8_MAX_BYTES_PER_CHAR).min(file_size);
         let start_pos = file_size - bytes_to_read;
 
         let mut file = file;
@@ -257,21 +275,62 @@ impl Slicer {
         let mut buffer = vec![0u8; bytes_to_read];
         file.read_exact(&mut buffer)?;
 
-        // Find valid UTF-8 boundary
-        let text = String::from_utf8_lossy(&buffer);
-        let total_chars = text.chars().count();
-        let skip = total_chars.saturating_sub(n);
+        let text = suffix_text(&buffer, start_pos > 0);
+        let suffix_chars = text.chars().count();
+        let skip = suffix_chars.saturating_sub(n);
         let content: String = text.chars().skip(skip).collect();
         let char_count = content.chars().count();
+        let total_chars = count_file_chars(path)?;
+        let start = total_chars.saturating_sub(char_count);
 
         Ok((
             content,
             SliceInfo::Chars {
-                start: start_pos + skip,
-                end: start_pos + skip + char_count,
+                start,
+                end: total_chars,
             },
         ))
     }
+}
+
+fn count_file_lines(path: &PathBuf) -> Result<usize> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut buffer = Vec::new();
+    let mut count = 0;
+
+    loop {
+        let bytes_read = reader.read_until(b'\n', &mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        count += 1;
+        buffer.clear();
+    }
+
+    Ok(count)
+}
+
+fn count_file_chars(path: &PathBuf) -> Result<usize> {
+    let content =
+        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&content).chars().count())
+}
+
+fn suffix_text(buffer: &[u8], may_start_mid_char: bool) -> std::borrow::Cow<'_, str> {
+    if !may_start_mid_char {
+        return String::from_utf8_lossy(buffer);
+    }
+
+    let max_offset = buffer.len().min(UTF8_MAX_BYTES_PER_CHAR);
+    for offset in 0..max_offset {
+        if let Ok(text) = std::str::from_utf8(&buffer[offset..]) {
+            return std::borrow::Cow::Borrowed(text);
+        }
+    }
+
+    String::from_utf8_lossy(buffer)
 }
 
 #[cfg(test)]
@@ -340,6 +399,53 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_length_slices_report_empty_ranges() {
+        let content = "line1\nline2\nline3";
+        let file = create_temp_file(content);
+        let path = file.path().to_path_buf();
+
+        let cases = [
+            SliceMode::HeadLines(0),
+            SliceMode::TailLines(0),
+            SliceMode::HeadChars(0),
+            SliceMode::TailChars(0),
+        ];
+
+        for mode in cases {
+            let result = Slicer::new(mode.clone()).process_file(&path).unwrap();
+            assert_eq!(result.content, "");
+            match mode {
+                SliceMode::HeadLines(_) | SliceMode::TailLines(_) => {
+                    assert_eq!(result.slice_info, SliceInfo::Lines { start: 0, end: 0 });
+                }
+                SliceMode::HeadChars(_) | SliceMode::TailChars(_) => {
+                    assert_eq!(result.slice_info, SliceInfo::Chars { start: 0, end: 0 });
+                }
+                SliceMode::Full => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_char_counts_do_not_overflow() {
+        let content = "Hello, 世界!";
+        let file = create_temp_file(content);
+        let path = file.path().to_path_buf();
+
+        let head = Slicer::new(SliceMode::HeadChars(usize::MAX))
+            .process_file(&path)
+            .unwrap();
+        let tail = Slicer::new(SliceMode::TailChars(usize::MAX))
+            .process_file(&path)
+            .unwrap();
+
+        assert_eq!(head.content, content);
+        assert_eq!(head.slice_info, SliceInfo::Chars { start: 0, end: 10 });
+        assert_eq!(tail.content, content);
+        assert_eq!(tail.slice_info, SliceInfo::Chars { start: 0, end: 10 });
+    }
+
+    #[test]
     fn test_read_tail_lines_small_file() {
         let content = "line1\nline2\nline3\nline4\nline5";
         let file = create_temp_file(content);
@@ -352,6 +458,28 @@ mod tests {
     }
 
     #[test]
+    fn test_read_tail_lines_large_file_reports_exact_line_numbers() {
+        let content = (1..=20_000)
+            .map(|n| format!("line{}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = create_temp_file(&content);
+        let path = file.path().to_path_buf();
+
+        let slicer = Slicer::new(SliceMode::TailLines(3));
+        let result = slicer.process_file(&path).unwrap();
+
+        assert_eq!(result.content, "line19998\nline19999\nline20000");
+        assert_eq!(
+            result.slice_info,
+            SliceInfo::Lines {
+                start: 19998,
+                end: 20000
+            }
+        );
+    }
+
+    #[test]
     fn test_read_tail_chars() {
         let content = "Hello, World!";
         let file = create_temp_file(content);
@@ -361,6 +489,19 @@ mod tests {
         let result = slicer.process_file(&path).unwrap();
 
         assert_eq!(result.content, "World!");
+    }
+
+    #[test]
+    fn test_read_tail_chars_reports_character_offsets() {
+        let content = "ééé";
+        let file = create_temp_file(content);
+        let path = file.path().to_path_buf();
+
+        let slicer = Slicer::new(SliceMode::TailChars(1));
+        let result = slicer.process_file(&path).unwrap();
+
+        assert_eq!(result.content, "é");
+        assert_eq!(result.slice_info, SliceInfo::Chars { start: 2, end: 3 });
     }
 
     #[test]

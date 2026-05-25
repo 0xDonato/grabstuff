@@ -42,9 +42,9 @@ struct Cli {
     #[arg(long)]
     full: bool,
 
-    /// Output format
-    #[arg(long, value_enum, default_value = "md")]
-    format: FormatArg,
+    /// Output format (overrides config default)
+    #[arg(long, value_enum)]
+    format: Option<FormatArg>,
 
     /// Write output to file
     #[arg(long, short)]
@@ -53,6 +53,10 @@ struct Cli {
     /// Copy output to clipboard
     #[arg(long)]
     copy: bool,
+
+    /// Display token count in output
+    #[arg(long)]
+    tokens: bool,
 
     /// Ignore patterns (can be specified multiple times)
     #[arg(long)]
@@ -154,8 +158,12 @@ fn run_query(cli: &Cli, config: &Config) -> Result<()> {
     file_contents.sort_by(|a, b| a.path.cmp(&b.path));
 
     // Format output
-    let format: Format = cli.format.clone().into();
-    let formatter = Formatter::new(format);
+    let format: Format = cli
+        .format
+        .clone()
+        .map(Into::into)
+        .unwrap_or_else(|| config.defaults.format.clone().into());
+    let formatter = Formatter::new(format).with_tokens(cli.tokens);
     let output = formatter.format(&file_contents)?;
 
     // Write output
@@ -240,24 +248,91 @@ fn parse_slice_mode(
 fn get_help() -> &'static str {
     r#"grabstuff - Query, slice, and compile content from local files
 
+WHAT IT DOES:
+    grabstuff finds local text files from one or more glob patterns, extracts
+    either the full file or a requested head/tail slice, and combines the
+    results into Markdown, plain text, or JSON. It is meant for quickly building
+    project context that can be saved, copied, or piped into another tool.
+
+WHEN RUN WITH NO ARGUMENTS:
+    grabstuff prints this overview and exits successfully. It does not scan the
+    current directory, read files, create config, write output files, or copy
+    anything to the clipboard until you provide patterns or a subcommand.
+
 USAGE:
     grabstuff <PATTERNS>... [OPTIONS]
     grabstuff run <file.grab>
     grabstuff init
 
+HOW A QUERY RUNS:
+    1. Loads config from .grabstuff.yaml, then ~/.grabstuff/config.yaml, then
+       built-in defaults.
+    2. Expands each pattern, skipping ignored paths, binary files, and files
+       larger than 10MB.
+    3. Applies the selected slice mode to every matched file.
+    4. Sorts results by path for stable output.
+    5. Formats the result and writes it to stdout, a file, or the clipboard.
+
 EXAMPLES:
     grabstuff "src/*.rs" --head 50 lines
     grabstuff "*.md" --full --output context.md
     grabstuff "src/" "docs/" --head 100 lines --copy
+    grabstuff "Cargo.toml" --format json --tokens
+    grabstuff run context.grab
+    grabstuff init
+
+PATTERNS:
+    "src/*.rs"       Match Rust files directly in src
+    "src/**/*.rs"    Match Rust files recursively under src
+    "docs/"          Match all files under docs
+    "Cargo.toml"     Match one file
 
 OPTIONS:
     --head <N> <lines|chars>    Take first N lines or characters
     --tail <N> <lines|chars>    Take last N lines or characters
     --full                      Include entire file (default)
-    --format <md|plain|json>    Output format (default: md)
+    --format <md|plain|json>    Output format (default: config or md)
     --output <FILE>             Write to file instead of stdout
     --copy                      Copy to clipboard
+    --tokens                    Display token count in output
     --ignore <PATTERN>          Exclude files matching pattern
     --help                      Show this help
-    --version                   Show version"#
+    --version                   Show version
+
+CONFIG:
+    Project config: .grabstuff.yaml
+    Global config:  ~/.grabstuff/config.yaml
+
+    defaults:
+      format: md
+      ignore:
+        - .git/
+        - node_modules/
+        - target/
+        - .env
+
+GRABFILES:
+    A .grab file can store repeated queries:
+
+    --format md
+    --output context.md
+    src/*.rs --head 80 lines
+    docs/ --full
+
+    Run it with: grabstuff run context.grab"#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_arg_help_explains_behavior() {
+        let help = get_help();
+
+        assert!(help.contains("WHEN RUN WITH NO ARGUMENTS:"));
+        assert!(help.contains("does not scan the"));
+        assert!(help.contains("HOW A QUERY RUNS:"));
+        assert!(help.contains("GRABFILES:"));
+    }
 }

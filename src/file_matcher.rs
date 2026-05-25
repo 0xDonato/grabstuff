@@ -225,7 +225,12 @@ fn parse_pattern(pattern: &str) -> (PathBuf, String) {
                 (path, "**/*".to_string())
             } else if let Some(parent) = path.parent() {
                 let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-                (parent.to_path_buf(), file_name)
+                let base = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+                (base, file_name)
             } else {
                 (PathBuf::from("."), pattern.to_string())
             }
@@ -321,6 +326,13 @@ mod tests {
         let (base, glob) = parse_pattern("src/**/*.rs");
         assert_eq!(base, PathBuf::from("src"));
         assert_eq!(glob, "**/*.rs");
+    }
+
+    #[test]
+    fn test_parse_pattern_bare_file_uses_current_dir() {
+        let (base, glob) = parse_pattern("Cargo.toml");
+        assert_eq!(base, PathBuf::from("."));
+        assert_eq!(glob, "Cargo.toml");
     }
 
     #[test]
